@@ -1,0 +1,428 @@
+@'
+import hashlib
+import json
+import os
+import re
+import urllib.error
+import urllib.request
+from pathlib import Path
+import numpy as np
+import streamlit as st
+from pypdf import PdfReader
+from sentence_transformers import SentenceTransformer
+
+st.set_page_config(page_title="Chat With Your Notes", page_icon="📚", layout="wide")
+st.title("📚 Chat With Your Notes (RAG)")
+
+LIBRARY_DIR = Path("library")
+LIBRARY_DIR.mkdir(exist_ok=True)
+MANIFEST_PATH = LIBRARY_DIR / "manifest.json"
+
+
+@st.cache_resource
+def load_embedder():
+    return SentenceTransformer("all-MiniLM-L6-v2")
+
+
+embedder = load_embedder()
+
+
+def load_manifest() -> dict:
+    if not MANIFEST_PATH.exists():
+        return {"last_doc_id": None, "docs": {}}
+    try:
+        data = json.loads(MANIFEST_PATH.read_text(encoding="utf-8"))
+        if isinstance(data, dict) and "docs" in data:
+            data.setdefault("last_doc_id", None)
+            return data
+    except Exception:
+        pass
+    return {"last_doc_id": None, "docs": {}}
+
+
+def save_manifest(manifest: dict) -> None:
+    MANIFEST_PATH.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+
+
+def save_pdf_to_memory(doc_id: str, filename: str, chunks: list, vectors: np.ndarray) -> None:
+    chunks_path = LIBRARY_DIR / f"{doc_id}.json"
+    vectors_path = LIBRARY_DIR / f"{doc_id}.npy"
+
+    chunks_path.write_text(json.dumps(chunks, ensure_ascii=False), encoding="utf-8")
+    np.save(vectors_path, vectors)
+
+    manifest = load_manifest()
+    manifest["docs"][doc_id] = {
+        "doc_id": doc_id,
+        "filename": filename,
+        "num_chunks": len(chunks),
+        "chunks_file": chunks_path.name,
+        "vectors_file": vectors_path.name,
+    }
+    manifest["last_doc_id"] = doc_id
+    save_manifest(manifest)
+
+
+def load_pdf_from_memory(doc_id: str) -> tuple[list, np.ndarray] | tuple[None, None]:
+    manifest = load_manifest()
+    meta = manifest.get("docs", {}).get(doc_id)
+    if not meta:
+        return None, None
+
+    chunks_path = LIBRARY_DIR / meta["chunks_file"]
+    vectors_path = LIBRARY_DIR / meta["vectors_file"]
+    if not chunks_path.exists() or not vectors_path.exists():
+        return None, None
+
+    chunks = json.loads(chunks_path.read_text(encoding="utf-8"))
+    vectors = np.load(vectors_path).astype(np.float32)
+
+    manifest["last_doc_id"] = doc_id
+    save_manifest(manifest)
+    return chunks, vectors
+
+
+def clean_readable_text(text: str) -> str:
+    if not text:
+        return ""
+    cleaned = re.sub(r"/(?:c|g|uni|x)[0-9A-Fa-f]+", " ", text)
+    cleaned = cleaned.replace("\ufffd", " ").replace("□", " ")
+    cleaned = re.sub(r"[\ue000-\uf8ff]", " ", cleaned)
+    cleaned = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", " ", cleaned)
+    cleaned = re.sub(
+        r"[^\x20-\x7e\u00a0-\u024f\u2010-\u2027\u2030-\u205e\u2100-\u214f\u2200-\u22ff]",
+        " ",
+        cleaned,
+    )
+    cleaned = re.sub(r"\s+([.,;:!?)\]])", r"\1", cleaned)
+    cleaned = re.sub(r"([(\[])\s+", r"\1", cleaned)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    return cleaned
+
+
+def extract_and_chunk_pdf(uploaded_file, chunk_words=500, overlap_words=80):
+    reader = PdfReader(uploaded_file)
+    chunks = []
+    chunk_index = 1
+
+    for page_num, page in enumerate(reader.pages, start=1):
+        raw_text = clean_readable_text(page.extract_text() or "")
+        words = raw_text.split()
+        if not words:
+            continue
+
+        step = max(1, chunk_words - overlap_words)
+        for start in range(0, len(words), step):
+            window = words[start : start + chunk_words]
+            if not window:
+                break
+
+            chunks.append({
+                "chunk_id": chunk_index,
+                "page": page_num,
+                "word_count": len(window),
+                "text": clean_readable_text(" ".join(window)),
+            })
+            chunk_index += 1
+
+            if start + chunk_words >= len(words):
+                break
+
+    return chunks
+
+
+def embed_chunks(chunks):
+    texts = [c["text"] for c in chunks]
+    vectors = embedder.encode(texts, normalize_embeddings=True, show_progress_bar=False)
+    return np.asarray(vectors, dtype=np.float32)
+
+
+def search_chunks(query, chunks, chunk_vectors, top_k=4):
+    top_k = max(3, min(5, int(top_k)))
+    query_vec = embedder.encode([query], normalize_embeddings=True, show_progress_bar=False)[0]
+    scores = np.dot(chunk_vectors, query_vec)
+    top_indices = np.argsort(scores)[::-1][:top_k]
+
+    return [
+        {
+            "chunk_id": chunks[idx]["chunk_id"],
+            "page": chunks[idx]["page"],
+            "score": float(scores[idx]),
+            "text": chunks[idx]["text"],
+        }
+        for idx in top_indices
+    ]
+
+
+def answer_locally_from_chunks(question: str, matches: list) -> str:
+    if not matches or matches[0]["score"] < 0.20:
+        return "I couldn't find that information in the provided notes."
+
+    stopwords = {
+        "what", "who", "when", "where", "why", "how", "is", "are", "the",
+        "and", "for", "from", "with", "that", "this", "into", "your"
+    }
+    keywords = {
+        w.lower()
+        for w in re.findall(r"[A-Za-z0-9]+", question)
+        if len(w) > 2 and w.lower() not in stopwords
+    }
+
+    picked = []
+    for m in matches[:3]:
+        clean_chunk = clean_readable_text(m["text"])
+        sentences = re.split(r"(?<=[.!?])\s+", clean_chunk)
+        scored_sents = []
+        for s in sentences:
+            s_clean = clean_readable_text(s)
+            words_in_s = re.findall(r"[A-Za-z0-9]+", s_clean)
+            if len(s_clean) < 15 or len(words_in_s) < 4:
+                continue
+            s_words = {w.lower() for w in words_in_s}
+            overlap = len(keywords & s_words)
+            scored_sents.append((overlap, s_clean))
+
+        scored_sents.sort(key=lambda item: item[0], reverse=True)
+        best_lines = [line for score, line in scored_sents[:2] if score > 0] or [
+            line for _, line in scored_sents[:1]
+        ]
+        if best_lines:
+            picked.append(f"- **Page {m['page']} (Chunk #{m['chunk_id']}):** " + " ".join(best_lines))
+
+    if not picked:
+        return "I couldn't find that information in the provided notes."
+
+    return clean_readable_text(
+        "**Cleaned Local Summary** — based strictly on your top retrieved chunks:\n\n"
+        + "\n".join(picked)
+    )
+
+
+def build_rag_messages(question, matches):
+    context_blocks = [
+        f"[Excerpt {i} | Page {m['page']} | Chunk #{m['chunk_id']}]\n{clean_readable_text(m['text'])}"
+        for i, m in enumerate(matches, start=1)
+    ]
+    context_text = "\n\n---\n\n".join(context_blocks)
+
+    system_prompt = (
+        "You are a study assistant answering questions from a student's uploaded PDF notes. "
+        "Answer ONLY from the provided context excerpts. Do not use outside knowledge or guess. "
+        "Cite page numbers in parentheses like (Page 84). Output clean, human-readable text only. "
+        "If the answer is not clearly present in the provided context, reply: "
+        "\"I couldn't find that information in the provided notes.\""
+    )
+
+    user_prompt = (
+        f"Context:\n{context_text}\n\n"
+        f"Question: {question}\n\n"
+        "Remember: answer only from the context above, cite page numbers, "
+        "and say if it is not there."
+    )
+    return [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_prompt},
+    ]
+
+
+def answer_with_ollama(question, matches, api_key, model="gemma4:31b"):
+    payload = {
+        "model": model.strip(),
+        "messages": build_rag_messages(question, matches),
+        "stream": False,
+    }
+    req = urllib.request.Request(
+        "https://ollama.com/api/chat",
+        data=json.dumps(payload).encode("utf-8"),
+        headers={
+            "Authorization": f"Bearer {api_key.strip()}",
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        body = exc.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"HTTP {exc.code}: {body}") from exc
+
+    raw_reply = data.get("message", {}).get("content", "")
+    return clean_readable_text(raw_reply)
+
+
+manifest = load_manifest()
+saved_docs = manifest.get("docs", {})
+
+# Auto-load last saved PDF on first session start
+if "active_doc_id" not in st.session_state:
+    last_id = manifest.get("last_doc_id")
+    if last_id and last_id in saved_docs:
+        loaded_chunks, loaded_vectors = load_pdf_from_memory(last_id)
+        if loaded_chunks is not None:
+            st.session_state["active_doc_id"] = last_id
+            st.session_state["chunks"] = loaded_chunks
+            st.session_state["vectors"] = loaded_vectors
+            st.session_state["messages"] = []
+    else:
+        st.session_state["active_doc_id"] = None
+
+with st.sidebar:
+    st.header("PDF Memory")
+    if saved_docs:
+        doc_ids = list(saved_docs.keys())
+        labels = {
+            did: f"{saved_docs[did]['filename']} ({saved_docs[did]['num_chunks']} chunks)"
+            for did in doc_ids
+        }
+        default_idx = doc_ids.index(st.session_state["active_doc_id"]) if st.session_state.get("active_doc_id") in doc_ids else 0
+        selected_doc_id = st.selectbox(
+            "Saved PDFs in Memory",
+            options=doc_ids,
+            index=default_idx,
+            format_func=lambda did: labels[did],
+        )
+        col1, col2 = st.columns(2)
+        with col1:
+            if st.button("Fetch PDF"):
+                loaded_chunks, loaded_vectors = load_pdf_from_memory(selected_doc_id)
+                if loaded_chunks is not None:
+                    st.session_state["active_doc_id"] = selected_doc_id
+                    st.session_state["chunks"] = loaded_chunks
+                    st.session_state["vectors"] = loaded_vectors
+                    st.session_state["messages"] = []
+                    st.rerun()
+        with col2:
+            if st.button("Forget"):
+                meta = saved_docs.pop(selected_doc_id, None)
+                if meta:
+                    (LIBRARY_DIR / meta["chunks_file"]).unlink(missing_ok=True)
+                    (LIBRARY_DIR / meta["vectors_file"]).unlink(missing_ok=True)
+                if manifest.get("last_doc_id") == selected_doc_id:
+                    manifest["last_doc_id"] = next(iter(saved_docs.keys()), None)
+                save_manifest(manifest)
+                if st.session_state.get("active_doc_id") == selected_doc_id:
+                    st.session_state["active_doc_id"] = manifest.get("last_doc_id")
+                    if st.session_state["active_doc_id"]:
+                        c, v = load_pdf_from_memory(st.session_state["active_doc_id"])
+                        st.session_state["chunks"] = c or []
+                        st.session_state["vectors"] = v
+                    else:
+                        st.session_state["chunks"] = []
+                        st.session_state["vectors"] = None
+                    st.session_state["messages"] = []
+                st.rerun()
+    else:
+        st.caption("No saved PDFs in memory yet. Upload a PDF to save it automatically.")
+
+    st.divider()
+    st.header("Settings")
+    use_free_local = st.checkbox(
+        "Use free local answers (no API key/credits needed)",
+        value=True,
+    )
+    api_key = st.text_input(
+        "Ollama API Key (optional)",
+        value=os.environ.get("OLLAMA_API_KEY", ""),
+        type="password",
+        placeholder="Paste Ollama API key if you have credits...",
+    )
+    model_name = st.text_input("Ollama Cloud Model", value="gemma4:31b")
+    top_k = st.slider("Top matching chunks to send", min_value=3, max_value=5, value=4)
+    if st.button("Clear chat"):
+        st.session_state["messages"] = []
+        st.rerun()
+
+uploaded_file = st.file_uploader("Upload a new PDF (auto-saved to memory)", type=["pdf"])
+
+if uploaded_file is not None:
+    file_bytes = uploaded_file.getvalue()
+    doc_id = hashlib.sha256(file_bytes).hexdigest()[:12]
+    if st.session_state.get("active_doc_id") != doc_id:
+        if doc_id in load_manifest().get("docs", {}):
+            loaded_chunks, loaded_vectors = load_pdf_from_memory(doc_id)
+            if loaded_chunks is not None:
+                st.session_state["active_doc_id"] = doc_id
+                st.session_state["chunks"] = loaded_chunks
+                st.session_state["vectors"] = loaded_vectors
+                st.session_state["messages"] = []
+                st.info(f"Loaded **{uploaded_file.name}** from saved memory without re-embedding.")
+        else:
+            with st.spinner("Extracting, cleaning text, creating embeddings, and saving to memory..."):
+                chunks = extract_and_chunk_pdf(uploaded_file, chunk_words=500, overlap_words=80)
+                if chunks:
+                    vectors = embed_chunks(chunks)
+                    save_pdf_to_memory(doc_id, uploaded_file.name, chunks, vectors)
+                    st.session_state["active_doc_id"] = doc_id
+                    st.session_state["chunks"] = chunks
+                    st.session_state["vectors"] = vectors
+                    st.session_state["messages"] = []
+                else:
+                    st.session_state["active_doc_id"] = None
+                    st.session_state["chunks"] = []
+                    st.session_state["vectors"] = None
+
+chunks = st.session_state.get("chunks", [])
+vectors = st.session_state.get("vectors")
+active_id = st.session_state.get("active_doc_id")
+active_name = load_manifest().get("docs", {}).get(active_id, {}).get("filename") if active_id else None
+
+if not chunks or vectors is None:
+    st.info("Upload a PDF to index and save it to memory, or select a saved PDF from the sidebar.")
+else:
+    st.success(f"Active in memory: **{active_name or 'PDF'}** — **{len(chunks)}** cleaned chunks ready.")
+
+    if "messages" not in st.session_state:
+        st.session_state["messages"] = []
+
+    for msg in st.session_state["messages"]:
+        with st.chat_message(msg["role"]):
+            st.markdown(msg["content"])
+            if msg.get("sources"):
+                with st.expander("Retrieved chunks"):
+                    for rank, item in enumerate(msg["sources"], start=1):
+                        st.markdown(
+                            f"**#{rank} — Page {item['page']} (Chunk #{item['chunk_id']})** "
+                            f"| Similarity: `{item['score']:.3f}`"
+                        )
+                        st.write(item["text"])
+                        st.divider()
+
+    question = st.chat_input("Ask a question about your notes...")
+    if question:
+        st.session_state["messages"].append({"role": "user", "content": question})
+        with st.chat_message("user"):
+            st.markdown(question)
+
+        matches = search_chunks(question, chunks, vectors, top_k=top_k)
+
+        with st.chat_message("assistant"):
+            if use_free_local or not api_key.strip():
+                reply = answer_locally_from_chunks(question, matches)
+                st.markdown(reply)
+            else:
+                with st.spinner(f"Asking {model_name} using retrieved chunks..."):
+                    try:
+                        reply = answer_with_ollama(question, matches, api_key, model=model_name)
+                        st.markdown(reply)
+                    except Exception as exc:
+                        reply = f"Error calling Ollama API: {exc}"
+                        st.error(reply)
+
+            with st.expander("Retrieved chunks"):
+                for rank, item in enumerate(matches, start=1):
+                    st.markdown(
+                        f"**#{rank} — Page {item['page']} (Chunk #{item['chunk_id']})** "
+                        f"| Similarity: `{item['score']:.3f}`"
+                    )
+                    st.write(item["text"])
+                    st.divider()
+
+        st.session_state["messages"].append({
+            "role": "assistant",
+            "content": reply,
+            "sources": matches,
+        })
+'@ | Out-File -FilePath app.py -Encoding utf8
+
+streamlit run app.py
