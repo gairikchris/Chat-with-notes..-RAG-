@@ -1,0 +1,1304 @@
+@'
+import hashlib
+import json
+import os
+import re
+import urllib.error
+import urllib.parse
+import urllib.request
+from datetime import datetime
+from pathlib import Path
+import numpy as np
+import streamlit as st
+from pypdf import PdfReader
+from sentence_transformers import SentenceTransformer
+
+st.set_page_config(page_title="Chat With Your Notes", page_icon="📚", layout="wide")
+
+LIBRARY_DIR = Path("library")
+LIBRARY_DIR.mkdir(exist_ok=True)
+MANIFEST_PATH = LIBRARY_DIR / "manifest.json"
+SESSIONS_PATH = LIBRARY_DIR / "chat_sessions.json"
+GOOGLE_MEMORY_PATH = LIBRARY_DIR / "google_search_memory.json"
+
+MODE_CHUNKS = "Notes Chunks Summary"
+MODE_AI_MODE = "Google AI Mode"
+MODES = [MODE_CHUNKS, MODE_AI_MODE]
+
+THEME_DARK = "Dark"
+THEME_LIGHT = "Light"
+THEMES = [THEME_DARK, THEME_LIGHT]
+
+MATH_PRESERVED_CHARS = (
+    "A-Za-z0-9\\s.,;:!?()\\[\\]{}+\\-*/=<>^_%°'\"&@#|"
+    "\\u00b0-\\u036f\\u2070-\\u209f\\u2100-\\u22ff"
+)
+
+
+@st.cache_resource
+def load_embedder():
+    return SentenceTransformer("all-MiniLM-L6-v2")
+
+
+embedder = load_embedder()
+
+
+def clean_readable_text(text: str, preserve_math: bool = True) -> str:
+    if not text:
+        return ""
+    cleaned = re.sub(r"/(?:c|g|uni|x)[0-9A-Fa-f]+", " ", text)
+    cleaned = cleaned.replace("\ufffd", " ").replace("□", " ")
+    cleaned = re.sub(r"[\ue000-\uf8ff]", " ", cleaned)
+    cleaned = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", " ", cleaned)
+
+    if preserve_math:
+        cleaned = re.sub(rf"[^{MATH_PRESERVED_CHARS}]", " ", cleaned)
+        cleaned = re.sub(r"\s+([.,;:!?)\]])", r"\1", cleaned)
+        cleaned = re.sub(r"([(\[])\s+", r"\1", cleaned)
+        cleaned = re.sub(r"\s*([=+\-*/<>^×÷±≤≥≠≈→←])\s*", r" \1 ", cleaned)
+    else:
+        cleaned = re.sub(r"[^A-Za-z0-9\s.,;:!?()\[\]{}+\-*/=<>^_%°'\"&@#]", " ", cleaned)
+        cleaned = re.sub(r"\s+([.,;:!?)\]])", r"\1", cleaned)
+        cleaned = re.sub(r"([(\[])\s+", r"\1", cleaned)
+        cleaned = re.sub(r"\s+", " ", cleaned)
+
+    cleaned = re.sub(r"[ \t]+", " ", cleaned)
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+    return cleaned.strip()
+
+
+def extract_formulas(text: str) -> list[str]:
+    if not text:
+        return []
+    candidates = []
+    pattern = re.compile(
+        r"(?:[A-Za-zτθαβγδελμωπφρσΩ0-9_()\s]{1,30}"
+        r"(?:=|×|÷|±|≤|≥|≠|≈|->|√|∑|∫)"
+        r"[A-Za-z0-9τθαβγδελμωπφρσΩ+\-*/^×÷±≤≥≠≈().,\s]{1,45})"
+    )
+    for match in pattern.findall(text):
+        expr = clean_readable_text(match, preserve_math=True)
+        if len(expr) >= 3 and re.search(r"[A-Za-z0-9τθαβγδελμωπφρσΩ]", expr):
+            candidates.append(expr)
+
+    seen = set()
+    unique = []
+    for item in candidates:
+        key = re.sub(r"\s+", "", item.lower())
+        if key not in seen:
+            seen.add(key)
+            unique.append(item)
+    return unique[:6]
+
+
+def is_formula_query(question: str) -> bool:
+    q = question.lower()
+    if re.search(r"\b(formula|equation|expression|derive|derivation|law)\b", q):
+        return True
+    if re.search(r"[=×÷±≤≥≠≈√∑∫^]", question):
+        return True
+    return False
+
+
+def highlight_formulas_in_text(text: str, formulas: list[str]) -> str:
+    if not text or not formulas:
+        return text
+    highlighted = text
+    for expr in sorted(formulas, key=len, reverse=True):
+        escaped = re.escape(expr)
+        if re.search(escaped, highlighted):
+            highlighted = re.sub(
+                escaped,
+                lambda m: f"<mark class='formula-glass'>{m.group(0)}</mark>",
+                highlighted,
+                count=2,
+            )
+    return highlighted
+
+
+def load_manifest() -> dict:
+    default = {
+        "last_doc_id": None,
+        "docs": {},
+        "preferences": {
+            "mode": MODE_CHUNKS,
+            "theme": THEME_DARK,
+            "use_free_local": True,
+            "model_name": "gemma4:31b",
+            "top_k": 4,
+        },
+        "saved_notes": [],
+        "saved_formulas": [],
+    }
+    if not MANIFEST_PATH.exists():
+        return default
+    try:
+        data = json.loads(MANIFEST_PATH.read_text(encoding="utf-8"))
+        if isinstance(data, dict):
+            data.setdefault("last_doc_id", None)
+            data.setdefault("docs", {})
+            data.setdefault("preferences", default["preferences"])
+            data["preferences"].setdefault("mode", MODE_CHUNKS)
+            data["preferences"].setdefault("theme", THEME_DARK)
+            data["preferences"].setdefault("use_free_local", True)
+            data["preferences"].setdefault("model_name", "gemma4:31b")
+            data["preferences"].setdefault("top_k", 4)
+            data.setdefault("saved_notes", [])
+            data.setdefault("saved_formulas", [])
+            return data
+    except Exception:
+        pass
+    return default
+
+
+def save_manifest(manifest: dict) -> None:
+    MANIFEST_PATH.write_text(json.dumps(manifest, indent=2, ensure_ascii=False), encoding="utf-8")
+
+
+def apply_ios27_liquid_glass_theme(theme: str) -> None:
+    is_dark = theme == THEME_DARK
+    if is_dark:
+        bg_base = "#07080a"
+        bg_grad = (
+            "radial-gradient(circle at 14% 8%, rgba(255,255,255,0.08), transparent 36%), "
+            "radial-gradient(circle at 86% 14%, rgba(255,255,255,0.06), transparent 38%), "
+            "linear-gradient(180deg, #090a0d 0%, #050608 100%)"
+        )
+        fg_primary = "#f5f5f7"
+        fg_muted = "rgba(245, 245, 247, 0.68)"
+        glass_bg = "rgba(255, 255, 255, 0.055)"
+        glass_bg_strong = "rgba(255, 255, 255, 0.095)"
+        glass_border = "rgba(255, 255, 255, 0.16)"
+        glass_highlight = "rgba(255, 255, 255, 0.28)"
+        btn_glass_bg = "rgba(255, 255, 255, 0.035)"
+        btn_glass_hover = "rgba(255, 255, 255, 0.08)"
+        btn_text = "#ffffff"
+        vibgyor_sheen = (
+            "linear-gradient(118deg, "
+            "rgba(148, 0, 211, 0.22) 0%, "
+            "rgba(75, 0, 130, 0.20) 15%, "
+            "rgba(0, 122, 255, 0.22) 30%, "
+            "rgba(0, 210, 120, 0.20) 46%, "
+            "rgba(255, 220, 0, 0.22) 64%, "
+            "rgba(255, 135, 0, 0.24) 80%, "
+            "rgba(255, 45, 65, 0.24) 100%)"
+        )
+        vibgyor_border = (
+            "linear-gradient(115deg, "
+            "rgba(158, 40, 255, 0.72), "
+            "rgba(95, 65, 255, 0.68), "
+            "rgba(35, 165, 255, 0.72), "
+            "rgba(30, 225, 135, 0.68), "
+            "rgba(255, 225, 40, 0.72), "
+            "rgba(255, 145, 25, 0.75), "
+            "rgba(255, 55, 75, 0.75))"
+        )
+        formula_bg = "rgba(255, 255, 255, 0.12)"
+        formula_border = "rgba(255, 255, 255, 0.32)"
+    else:
+        bg_base = "#f4f5f7"
+        bg_grad = (
+            "radial-gradient(circle at 14% 8%, rgba(255,255,255,0.92), transparent 40%), "
+            "radial-gradient(circle at 86% 14%, rgba(255,255,255,0.82), transparent 42%), "
+            "linear-gradient(180deg, #f7f8fa 0%, #eceef2 100%)"
+        )
+        fg_primary = "#111214"
+        fg_muted = "rgba(17, 18, 20, 0.66)"
+        glass_bg = "rgba(255, 255, 255, 0.58)"
+        glass_bg_strong = "rgba(255, 255, 255, 0.74)"
+        glass_border = "rgba(17, 18, 20, 0.14)"
+        glass_highlight = "rgba(255, 255, 255, 0.95)"
+        btn_glass_bg = "rgba(255, 255, 255, 0.24)"
+        btn_glass_hover = "rgba(255, 255, 255, 0.42)"
+        btn_text = "#111214"
+        vibgyor_sheen = (
+            "linear-gradient(118deg, "
+            "rgba(148, 0, 211, 0.16) 0%, "
+            "rgba(75, 0, 130, 0.14) 15%, "
+            "rgba(0, 122, 255, 0.16) 30%, "
+            "rgba(0, 210, 120, 0.15) 46%, "
+            "rgba(255, 220, 0, 0.18) 64%, "
+            "rgba(255, 135, 0, 0.18) 80%, "
+            "rgba(255, 45, 65, 0.18) 100%)"
+        )
+        vibgyor_border = (
+            "linear-gradient(115deg, "
+            "rgba(148, 0, 211, 0.62), "
+            "rgba(75, 0, 130, 0.58), "
+            "rgba(0, 122, 255, 0.65), "
+            "rgba(0, 195, 110, 0.60), "
+            "rgba(235, 195, 0, 0.65), "
+            "rgba(255, 125, 0, 0.68), "
+            "rgba(240, 40, 60, 0.68))"
+        )
+        formula_bg = "rgba(17, 18, 20, 0.08)"
+        formula_border = "rgba(17, 18, 20, 0.24)"
+
+    st.markdown(
+        f"""
+        <style>
+        :root {{
+            --lg-bg-base: {bg_base};
+            --lg-bg-grad: {bg_grad};
+            --lg-fg: {fg_primary};
+            --lg-muted: {fg_muted};
+            --lg-surface: {glass_bg};
+            --lg-surface-strong: {glass_bg_strong};
+            --lg-border: {glass_border};
+            --lg-highlight: {glass_highlight};
+            --lg-btn-bg: {btn_glass_bg};
+            --lg-btn-hover: {btn_glass_hover};
+            --lg-btn-text: {btn_text};
+            --lg-vibgyor-sheen: {vibgyor_sheen};
+            --lg-vibgyor-border: {vibgyor_border};
+            --lg-formula-bg: {formula_bg};
+            --lg-formula-border: {formula_border};
+        }}
+
+        @keyframes dropletDispersion {{
+            0% {{
+                background-position: 0% 50%;
+            }}
+            50% {{
+                background-position: 100% 50%;
+            }}
+            100% {{
+                background-position: 0% 50%;
+            }}
+        }}
+
+        .stApp, [data-testid="stAppViewContainer"] {{
+            background: var(--lg-bg-grad), var(--lg-bg-base) !important;
+            color: var(--lg-fg) !important;
+        }}
+
+        [data-testid="stHeader"] {{
+            background: transparent !important;
+        }}
+
+        .block-container {{
+            padding-top: 1.35rem;
+            padding-bottom: 6rem;
+            max-width: 1180px;
+        }}
+
+        /* Liquid Glass Header */
+        .ios27-header {{
+            backdrop-filter: blur(28px) saturate(180%);
+            -webkit-backdrop-filter: blur(28px) saturate(180%);
+            background: var(--lg-surface-strong);
+            border: 1px solid var(--lg-border);
+            box-shadow:
+                inset 0 1px 0 var(--lg-highlight),
+                0 12px 32px rgba(0, 0, 0, 0.14);
+            border-radius: 26px;
+            padding: 1.15rem 1.45rem;
+            margin-bottom: 1rem;
+        }}
+        .ios27-title {{
+            font-size: 2.05rem;
+            font-weight: 700;
+            letter-spacing: -0.025em;
+            line-height: 1.15;
+            color: var(--lg-fg);
+            margin: 0;
+        }}
+        .ios27-subtitle {{
+            font-size: 0.9rem;
+            color: var(--lg-muted);
+            margin-top: 0.25rem;
+            margin-bottom: 0;
+        }}
+
+        /* Liquid Glass Panels & Expanders */
+        .ios27-glass-card,
+        [data-testid="stExpander"],
+        [data-testid="stFileUploaderDropzone"],
+        [data-testid="stAlert"] {{
+            backdrop-filter: blur(24px) saturate(175%) !important;
+            -webkit-backdrop-filter: blur(24px) saturate(175%) !important;
+            background: var(--lg-surface) !important;
+            border: 1px solid var(--lg-border) !important;
+            box-shadow:
+                inset 0 1px 0 var(--lg-highlight),
+                0 8px 24px rgba(0, 0, 0, 0.10) !important;
+            border-radius: 22px !important;
+            color: var(--lg-fg) !important;
+        }}
+
+        .ios27-glass-card {{
+            padding: 0.9rem 1.1rem;
+            margin-bottom: 0.9rem;
+        }}
+
+        /* Sidebar Liquid Glass */
+        [data-testid="stSidebar"] > div:first-child {{
+            backdrop-filter: blur(32px) saturate(185%) !important;
+            -webkit-backdrop-filter: blur(32px) saturate(185%) !important;
+            background: var(--lg-surface-strong) !important;
+            border-right: 1px solid var(--lg-border) !important;
+            box-shadow: inset -1px 0 0 var(--lg-highlight) !important;
+        }}
+
+        /* Chat Messages Liquid Glass */
+        [data-testid="stChatMessage"] {{
+            backdrop-filter: blur(22px) saturate(170%) !important;
+            -webkit-backdrop-filter: blur(22px) saturate(170%) !important;
+            background: var(--lg-surface) !important;
+            border: 1px solid var(--lg-border) !important;
+            box-shadow:
+                inset 0 1px 0 var(--lg-highlight),
+                0 6px 20px rgba(0, 0, 0, 0.08) !important;
+            border-radius: 24px !important;
+            padding: 0.85rem 1rem !important;
+            margin-bottom: 0.65rem !important;
+        }}
+
+        /* Inputs & Selectboxes Liquid Glass */
+        .stTextInput input,
+        [data-baseweb="select"] > div {{
+            backdrop-filter: blur(20px) saturate(170%) !important;
+            -webkit-backdrop-filter: blur(20px) saturate(170%) !important;
+            background: var(--lg-surface) !important;
+            color: var(--lg-fg) !important;
+            border: 1px solid var(--lg-border) !important;
+            border-radius: 18px !important;
+            box-shadow: inset 0 1px 0 var(--lg-highlight) !important;
+        }}
+
+        /* Transparent Water-Droplet VIBGYOR Prism Glass Buttons */
+        .stButton > button,
+        .stLinkButton > a,
+        [data-testid="stBaseButton-secondary"],
+        [data-testid="stBaseButton-primary"] {{
+            position: relative !important;
+            overflow: hidden !important;
+            backdrop-filter: blur(18px) saturate(210%) contrast(106%) !important;
+            -webkit-backdrop-filter: blur(18px) saturate(210%) contrast(106%) !important;
+            background:
+                var(--lg-vibgyor-sheen),
+                var(--lg-btn-bg) !important;
+            background-size: 240% 240%, 100% 100% !important;
+            animation: dropletDispersion 9s ease-in-out infinite !important;
+            color: var(--lg-btn-text) !important;
+            border: 1.5px solid transparent !important;
+            border-radius: 999px !important;
+            font-weight: 600 !important;
+            box-shadow:
+                inset 0 1.5px 1.5px var(--lg-highlight),
+                inset 0 -2px 6px rgba(148, 0, 211, 0.14),
+                0 0 0 1px rgba(255, 255, 255, 0.14),
+                0 8px 22px rgba(0, 0, 0, 0.14) !important;
+            transition: transform 0.16s ease, box-shadow 0.22s ease, filter 0.22s ease !important;
+        }}
+
+        .stButton > button::before,
+        .stLinkButton > a::before {{
+            content: "";
+            position: absolute;
+            inset: 0;
+            border-radius: inherit;
+            padding: 1.5px;
+            background: var(--lg-vibgyor-border);
+            background-size: 220% 220%;
+            animation: dropletDispersion 7s linear infinite;
+            -webkit-mask:
+                linear-gradient(#fff 0 0) content-box,
+                linear-gradient(#fff 0 0);
+            -webkit-mask-composite: xor;
+            mask-composite: exclude;
+            pointer-events: none;
+            opacity: 0.92;
+        }}
+
+        .stButton > button:hover,
+        .stLinkButton > a:hover {{
+            background:
+                var(--lg-vibgyor-sheen),
+                var(--lg-btn-hover) !important;
+            background-size: 240% 240%, 100% 100% !important;
+            filter: saturate(1.25) brightness(1.06);
+            box-shadow:
+                inset 0 1.5px 2px var(--lg-highlight),
+                0 0 16px rgba(0, 180, 255, 0.18),
+                0 10px 26px rgba(0, 0, 0, 0.18) !important;
+            transform: translateY(-1.5px) scale(1.02);
+        }}
+
+        .stButton > button:active,
+        .stLinkButton > a:active {{
+            transform: scale(0.96);
+        }}
+
+        /* Circular Buttons for Back / Enter / Send / Clear / History */
+        .circle-trigger-wrap .stButton > button,
+        [data-testid="stChatInputSubmitButton"] button,
+        [data-testid="stChatInput"] button {{
+            width: 42px !important;
+            height: 42px !important;
+            min-width: 42px !important;
+            min-height: 42px !important;
+            max-width: 42px !important;
+            max-height: 42px !important;
+            padding: 0 !important;
+            border-radius: 50% !important;
+            display: inline-flex !important;
+            align-items: center !important;
+            justify-content: center !important;
+        }}
+
+        /* Bottom Chat Input Liquid Glass Capsule */
+        [data-testid="stChatInput"] > div {{
+            backdrop-filter: blur(28px) saturate(185%) !important;
+            -webkit-backdrop-filter: blur(28px) saturate(185%) !important;
+            background: var(--lg-surface-strong) !important;
+            border: 1px solid var(--lg-border) !important;
+            box-shadow:
+                inset 0 1px 0 var(--lg-highlight),
+                0 12px 30px rgba(0, 0, 0, 0.16) !important;
+            border-radius: 999px !important;
+        }}
+        [data-testid="stChatInput"] textarea {{
+            color: var(--lg-fg) !important;
+        }}
+
+        /* Formula Highlight in Monochrome Glass */
+        .formula-glass {{
+            background: var(--lg-formula-bg);
+            border: 1px solid var(--lg-formula-border);
+            color: var(--lg-fg);
+            padding: 0.12rem 0.45rem;
+            border-radius: 999px;
+            font-weight: 650;
+        }}
+
+        p, span, label, div, small {{
+            color: inherit;
+        }}
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def save_formulas_to_memory(formulas: list[str]) -> None:
+    if not formulas:
+        return
+    manifest = load_manifest()
+    existing = manifest.get("saved_formulas", [])
+    existing_keys = {re.sub(r"\s+", "", f.lower()) for f in existing}
+    changed = False
+    for f in formulas:
+        cleaned_f = clean_readable_text(f, preserve_math=True)
+        norm_key = re.sub(r"\s+", "", cleaned_f.lower())
+        if cleaned_f and norm_key not in existing_keys:
+            existing.append(cleaned_f)
+            existing_keys.add(norm_key)
+            changed = True
+    if changed:
+        manifest["saved_formulas"] = existing[-50:]
+        save_manifest(manifest)
+
+
+def load_sessions() -> dict:
+    if not SESSIONS_PATH.exists():
+        return {"sessions": []}
+    try:
+        data = json.loads(SESSIONS_PATH.read_text(encoding="utf-8"))
+        if isinstance(data, dict) and isinstance(data.get("sessions"), list):
+            return data
+    except Exception:
+        pass
+    return {"sessions": []}
+
+
+def save_sessions(data: dict) -> None:
+    SESSIONS_PATH.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+
+
+def create_new_session_id() -> str:
+    return datetime.now().strftime("session_%Y%m%d_%H%M%S_%f")[:24]
+
+
+def persist_current_session() -> None:
+    messages = st.session_state.get("messages", [])
+    session_id = st.session_state.get("session_id")
+    if not session_id or not messages:
+        return
+
+    first_user_msg = next(
+        (m.get("content", "").strip() for m in messages if m.get("role") == "user" and m.get("content", "").strip()),
+        "Untitled Chat",
+    )
+    title = first_user_msg[:42] + ("..." if len(first_user_msg) > 42 else "")
+    doc_id = st.session_state.get("active_doc_id")
+    doc_name = load_manifest().get("docs", {}).get(doc_id, {}).get("filename") if doc_id else None
+
+    data = load_sessions()
+    sessions = data.get("sessions", [])
+    record = {
+        "session_id": session_id,
+        "title": title,
+        "doc_id": doc_id,
+        "doc_name": doc_name,
+        "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M"),
+        "messages": messages,
+    }
+    replaced = False
+    for i, item in enumerate(sessions):
+        if item.get("session_id") == session_id:
+            sessions[i] = record
+            replaced = True
+            break
+    if not replaced:
+        sessions.append(record)
+
+    data["sessions"] = sessions[-40:]
+    save_sessions(data)
+
+
+def load_google_memory() -> dict:
+    if not GOOGLE_MEMORY_PATH.exists():
+        return {"searches": {}}
+    try:
+        data = json.loads(GOOGLE_MEMORY_PATH.read_text(encoding="utf-8"))
+        if isinstance(data, dict) and isinstance(data.get("searches"), dict):
+            return data
+    except Exception:
+        pass
+    return {"searches": {}}
+
+
+def save_google_memory(memory: dict) -> None:
+    GOOGLE_MEMORY_PATH.write_text(json.dumps(memory, indent=2, ensure_ascii=False), encoding="utf-8")
+
+
+def normalize_search_key(query: str) -> str:
+    clean_q = re.sub(r"^(?:aimode:|ai:|google:|web:|search:)\s*", "", query.strip(), flags=re.IGNORECASE).strip()
+    return re.sub(r"\s+", " ", clean_q.lower())
+
+
+def build_google_ai_mode_url(query: str) -> str:
+    return "https://www.google.com/search?q=" + urllib.parse.quote_plus(query) + "&udm=50"
+
+
+def save_pdf_to_memory(doc_id: str, filename: str, chunks: list, vectors: np.ndarray) -> None:
+    chunks_path = LIBRARY_DIR / f"{doc_id}.json"
+    vectors_path = LIBRARY_DIR / f"{doc_id}.npy"
+
+    chunks_path.write_text(json.dumps(chunks, ensure_ascii=False), encoding="utf-8")
+    np.save(vectors_path, vectors)
+
+    manifest = load_manifest()
+    manifest["docs"][doc_id] = {
+        "doc_id": doc_id,
+        "filename": filename,
+        "num_chunks": len(chunks),
+        "chunks_file": chunks_path.name,
+        "vectors_file": vectors_path.name,
+    }
+    manifest["last_doc_id"] = doc_id
+    save_manifest(manifest)
+
+
+def load_pdf_from_memory(doc_id: str) -> tuple[list, np.ndarray] | tuple[None, None]:
+    manifest = load_manifest()
+    meta = manifest.get("docs", {}).get(doc_id)
+    if not meta:
+        return None, None
+
+    chunks_path = LIBRARY_DIR / meta["chunks_file"]
+    vectors_path = LIBRARY_DIR / meta["vectors_file"]
+    if not chunks_path.exists() or not vectors_path.exists():
+        return None, None
+
+    chunks = json.loads(chunks_path.read_text(encoding="utf-8"))
+    vectors = np.load(vectors_path).astype(np.float32)
+
+    manifest["last_doc_id"] = doc_id
+    save_manifest(manifest)
+    return chunks, vectors
+
+
+def extract_and_chunk_pdf(uploaded_file, chunk_words=500, overlap_words=80):
+    reader = PdfReader(uploaded_file)
+    chunks = []
+    chunk_index = 1
+
+    for page_num, page in enumerate(reader.pages, start=1):
+        raw_text = clean_readable_text(page.extract_text() or "", preserve_math=True)
+        words = raw_text.split()
+        if not words:
+            continue
+
+        step = max(1, chunk_words - overlap_words)
+        for start in range(0, len(words), step):
+            window = words[start : start + chunk_words]
+            if not window:
+                break
+
+            chunks.append({
+                "chunk_id": chunk_index,
+                "page": page_num,
+                "word_count": len(window),
+                "text": clean_readable_text(" ".join(window), preserve_math=True),
+            })
+            chunk_index += 1
+
+            if start + chunk_words >= len(words):
+                break
+
+    return chunks
+
+
+def embed_chunks(chunks):
+    texts = [c["text"] for c in chunks]
+    vectors = embedder.encode(texts, normalize_embeddings=True, show_progress_bar=False)
+    return np.asarray(vectors, dtype=np.float32)
+
+
+def search_chunks(query, chunks, chunk_vectors, top_k=4):
+    top_k = max(3, min(5, int(top_k)))
+    query_vec = embedder.encode([query], normalize_embeddings=True, show_progress_bar=False)[0]
+    scores = np.dot(chunk_vectors, query_vec)
+    top_indices = np.argsort(scores)[::-1][:top_k]
+
+    return [
+        {
+            "chunk_id": chunks[idx]["chunk_id"],
+            "page": chunks[idx]["page"],
+            "score": float(scores[idx]),
+            "text": chunks[idx]["text"],
+        }
+        for idx in top_indices
+    ]
+
+
+def fetch_google_ai_mode_context(query: str, force_refresh: bool = False) -> dict:
+    clean_q = re.sub(r"^(?:aimode:|ai:|google:|web:|search:)\s*", "", query.strip(), flags=re.IGNORECASE).strip()
+    search_key = normalize_search_key(clean_q)
+    ai_mode_url = build_google_ai_mode_url(clean_q)
+
+    memory = load_google_memory()
+    cached = memory["searches"].get(search_key)
+    if cached and not force_refresh:
+        result = dict(cached)
+        result["ai_mode_url"] = build_google_ai_mode_url(result.get("query", clean_q))
+        result["from_memory"] = True
+        return result
+
+    ddg_url = (
+        "https://api.duckduckgo.com/?q="
+        + urllib.parse.quote_plus(clean_q)
+        + "&format=json&no_html=1&skip_disambig=1"
+    )
+    summary = ""
+    source_name = "Google Search AI Mode"
+
+    try:
+        req = urllib.request.Request(ddg_url, headers={"User-Agent": "ChatWithYourNotes/1.0"})
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        summary = (
+            data.get("AbstractText")
+            or data.get("Answer")
+            or data.get("Definition")
+            or ""
+        ).strip()
+        if not summary and isinstance(data.get("RelatedTopics"), list):
+            for item in data["RelatedTopics"]:
+                if isinstance(item, dict) and item.get("Text"):
+                    summary = item["Text"].strip()
+                    break
+    except Exception:
+        summary = ""
+
+    entry = {
+        "query": clean_q,
+        "summary": clean_readable_text(summary, preserve_math=True),
+        "source_name": source_name,
+        "ai_mode_url": ai_mode_url,
+    }
+    memory["searches"][search_key] = entry
+    save_google_memory(memory)
+
+    result = dict(entry)
+    result["from_memory"] = False
+    return result
+
+
+def format_google_ai_mode_reply(ai_ctx: dict) -> str:
+    mem_tag = " *(from search memory)*" if ai_ctx.get("from_memory") else ""
+    ai_url = ai_ctx.get("ai_mode_url") or build_google_ai_mode_url(ai_ctx["query"])
+    if ai_ctx.get("summary"):
+        return (
+            f"**Google AI Mode{mem_tag}:**\n\n"
+            f"{ai_ctx['summary']}\n\n"
+            f"[Google Ai mode]({ai_url})"
+        )
+    return (
+        f"**Google AI Mode** for **{ai_ctx['query']}**{mem_tag} — "
+        f"[Google Ai mode]({ai_url})"
+    )
+
+
+def answer_locally_from_chunks(question: str, matches: list) -> tuple[str, bool]:
+    if not matches or matches[0]["score"] < 0.12:
+        return "There's no results in the pdf, refer Google Ai mode futher", True
+
+    stopwords = {
+        "what", "who", "when", "where", "why", "how", "is", "are", "the",
+        "and", "for", "from", "with", "that", "this", "into", "your"
+    }
+    keywords = {
+        w.lower()
+        for w in re.findall(r"[A-Za-z0-9]+", question)
+        if len(w) > 2 and w.lower() not in stopwords
+    }
+
+    picked = []
+    for m in matches[:3]:
+        clean_chunk = clean_readable_text(m["text"], preserve_math=True)
+        sentences = re.split(r"(?<=[.!?])\s+", clean_chunk)
+        scored_sents = []
+        for s in sentences:
+            s_clean = clean_readable_text(s, preserve_math=True)
+            words_in_s = re.findall(r"[A-Za-z0-9τθαβγδελμωπφρσΩ]+", s_clean)
+            if len(s_clean) < 10 or len(words_in_s) < 3:
+                continue
+            s_words = {w.lower() for w in words_in_s}
+            overlap = len(keywords & s_words)
+            scored_sents.append((overlap, s_clean))
+
+        scored_sents.sort(key=lambda item: item[0], reverse=True)
+        best_lines = [line for score, line in scored_sents[:2] if score > 0] or [
+            line for _, line in scored_sents[:1]
+        ]
+        if best_lines:
+            picked.append(f"- **Page {m['page']} (Chunk #{m['chunk_id']}):** " + " ".join(best_lines))
+
+    if not picked:
+        return "There's no results in the pdf, refer Google Ai mode futher", True
+
+    return (
+        "**Notes Chunks Summary** — based strictly on your retrieved PDF chunks:\n\n"
+        + "\n".join(picked),
+        False,
+    )
+
+
+def build_rag_messages(question, matches):
+    context_blocks = [
+        f"[Excerpt {i} | Page {m['page']} | Chunk #{m['chunk_id']}]\n{clean_readable_text(m['text'], preserve_math=True)}"
+        for i, m in enumerate(matches, start=1)
+    ]
+    context_text = "\n\n---\n\n".join(context_blocks)
+
+    system_prompt = (
+        "You are a study assistant answering questions from a student's uploaded PDF notes. "
+        "Answer ONLY from the provided context excerpts. Cite page numbers in parentheses like (Page 84). "
+        "Output clean, human-readable text with clear math symbols and formulas."
+    )
+    user_prompt = f"Context:\n{context_text}\n\nQuestion: {question}"
+    return [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_prompt},
+    ]
+
+
+def answer_with_ollama(question, matches, api_key, model="gemma4:31b"):
+    payload = {
+        "model": model.strip(),
+        "messages": build_rag_messages(question, matches),
+        "stream": False,
+    }
+    req = urllib.request.Request(
+        "https://ollama.com/api/chat",
+        data=json.dumps(payload).encode("utf-8"),
+        headers={
+            "Authorization": f"Bearer {api_key.strip()}",
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        body = exc.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"HTTP {exc.code}: {body}") from exc
+
+    return clean_readable_text(data.get("message", {}).get("content", ""), preserve_math=True)
+
+
+def render_google_ai_footer(query: str, no_pdf_result: bool = False) -> None:
+    ai_url = build_google_ai_mode_url(query)
+    if no_pdf_result:
+        st.markdown("There's no results in the pdf, refer Google Ai mode futher")
+    else:
+        st.markdown("If more details needed refer - Google Ai mode")
+    st.link_button("Google Ai mode", ai_url)
+
+
+manifest = load_manifest()
+saved_docs = manifest.get("docs", {})
+prefs = manifest.get("preferences", {})
+google_mem = load_google_memory()
+saved_searches = google_mem.get("searches", {})
+
+if "theme_mode" not in st.session_state:
+    saved_theme = prefs.get("theme", THEME_DARK)
+    st.session_state["theme_mode"] = saved_theme if saved_theme in THEMES else THEME_DARK
+
+apply_ios27_liquid_glass_theme(st.session_state["theme_mode"])
+
+if "fresh_session_initialized" not in st.session_state:
+    st.session_state["fresh_session_initialized"] = True
+    st.session_state["session_id"] = create_new_session_id()
+    st.session_state["messages"] = []
+    last_id = manifest.get("last_doc_id")
+    if last_id and last_id in saved_docs:
+        loaded_chunks, loaded_vectors = load_pdf_from_memory(last_id)
+        if loaded_chunks is not None:
+            st.session_state["active_doc_id"] = last_id
+            st.session_state["chunks"] = loaded_chunks
+            st.session_state["vectors"] = loaded_vectors
+        else:
+            st.session_state["active_doc_id"] = None
+            st.session_state["chunks"] = []
+            st.session_state["vectors"] = None
+    else:
+        st.session_state["active_doc_id"] = None
+        st.session_state["chunks"] = []
+        st.session_state["vectors"] = None
+
+saved_mode = prefs.get("mode", MODE_CHUNKS)
+if saved_mode not in MODES:
+    saved_mode = MODE_CHUNKS
+if "chat_mode" not in st.session_state:
+    st.session_state["chat_mode"] = saved_mode
+
+hdr_left, hdr_right = st.columns([6, 2])
+with hdr_left:
+    st.markdown(
+        """
+        <div class="ios27-header">
+            <div class="ios27-title">Chat With Your Notes (RAG)</div>
+            <p class="ios27-subtitle">by Gairik Chris</p>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+with hdr_right:
+    st.markdown('<div class="ios27-glass-card circle-trigger-wrap">', unsafe_allow_html=True)
+    c_theme, c_new, c_hist = st.columns(3)
+    with c_theme:
+        theme_icon = "☀" if st.session_state["theme_mode"] == THEME_DARK else "☾"
+        if st.button(theme_icon, key="top_theme_btn", help="Toggle Dark / Light mode"):
+            next_theme = THEME_LIGHT if st.session_state["theme_mode"] == THEME_DARK else THEME_DARK
+            st.session_state["theme_mode"] = next_theme
+            manifest["preferences"]["theme"] = next_theme
+            save_manifest(manifest)
+            st.rerun()
+    with c_new:
+        if st.button("＋", key="top_new_btn", help="Start a fresh chat"):
+            persist_current_session()
+            st.session_state["session_id"] = create_new_session_id()
+            st.session_state["messages"] = []
+            st.rerun()
+    with c_hist:
+        if st.button("⟲", key="top_hist_btn", help="Open history in sidebar"):
+            st.session_state["show_history_panel"] = not st.session_state.get("show_history_panel", False)
+            st.rerun()
+    st.markdown("</div>", unsafe_allow_html=True)
+
+with st.sidebar:
+    st.header("Appearance")
+    selected_theme = st.segmented_control(
+        "Appearance",
+        options=THEMES,
+        default=st.session_state["theme_mode"],
+        label_visibility="collapsed",
+    )
+    if selected_theme and selected_theme != st.session_state["theme_mode"]:
+        st.session_state["theme_mode"] = selected_theme
+        manifest["preferences"]["theme"] = selected_theme
+        save_manifest(manifest)
+        st.rerun()
+
+    st.divider()
+    st.header("Chat Sessions")
+    s_col1, s_col2 = st.columns([4, 1])
+    with s_col1:
+        if st.button("New Chat", use_container_width=True):
+            persist_current_session()
+            st.session_state["session_id"] = create_new_session_id()
+            st.session_state["messages"] = []
+            st.rerun()
+    with s_col2:
+        st.markdown('<div class="circle-trigger-wrap">', unsafe_allow_html=True)
+        if st.button("↩", key="sb_back_btn", help="Reset current session view"):
+            st.session_state["session_id"] = create_new_session_id()
+            st.session_state["messages"] = []
+            st.rerun()
+        st.markdown("</div>", unsafe_allow_html=True)
+
+    sessions_data = load_sessions()
+    past_sessions = list(reversed(sessions_data.get("sessions", [])))
+    with st.expander("History", expanded=bool(st.session_state.get("show_history_panel", False))):
+        if past_sessions:
+            for s_item in past_sessions:
+                s_label = f"{s_item.get('title', 'Chat')} ({s_item.get('updated_at', '')})"
+                if st.button(s_label, key=f"hist_sess_{s_item['session_id']}", use_container_width=True):
+                    persist_current_session()
+                    st.session_state["session_id"] = s_item["session_id"]
+                    st.session_state["messages"] = list(s_item.get("messages", []))
+                    s_doc = s_item.get("doc_id")
+                    if s_doc and s_doc in load_manifest().get("docs", {}):
+                        c, v = load_pdf_from_memory(s_doc)
+                        if c is not None:
+                            st.session_state["active_doc_id"] = s_doc
+                            st.session_state["chunks"] = c
+                            st.session_state["vectors"] = v
+                    st.rerun()
+        else:
+            st.caption("No past chat sessions saved yet.")
+
+    st.divider()
+    st.header("PDF Memory")
+    if saved_docs:
+        doc_ids = list(saved_docs.keys())
+        labels = {
+            did: f"{saved_docs[did]['filename']} ({saved_docs[did]['num_chunks']} chunks)"
+            for did in doc_ids
+        }
+        default_idx = doc_ids.index(st.session_state["active_doc_id"]) if st.session_state.get("active_doc_id") in doc_ids else 0
+        selected_doc_id = st.selectbox(
+            "Saved PDFs in Memory",
+            options=doc_ids,
+            index=default_idx,
+            format_func=lambda did: labels[did],
+        )
+        col1, col2 = st.columns(2)
+        with col1:
+            if st.button("Fetch PDF", use_container_width=True):
+                loaded_chunks, loaded_vectors = load_pdf_from_memory(selected_doc_id)
+                if loaded_chunks is not None:
+                    st.session_state["active_doc_id"] = selected_doc_id
+                    st.session_state["chunks"] = loaded_chunks
+                    st.session_state["vectors"] = loaded_vectors
+                    st.rerun()
+        with col2:
+            if st.button("Forget", use_container_width=True):
+                meta = saved_docs.pop(selected_doc_id, None)
+                if meta:
+                    (LIBRARY_DIR / meta["chunks_file"]).unlink(missing_ok=True)
+                    (LIBRARY_DIR / meta["vectors_file"]).unlink(missing_ok=True)
+                if manifest.get("last_doc_id") == selected_doc_id:
+                    manifest["last_doc_id"] = next(iter(saved_docs.keys()), None)
+                save_manifest(manifest)
+                if st.session_state.get("active_doc_id") == selected_doc_id:
+                    st.session_state["active_doc_id"] = manifest.get("last_doc_id")
+                    if st.session_state["active_doc_id"]:
+                        c, v = load_pdf_from_memory(st.session_state["active_doc_id"])
+                        st.session_state["chunks"] = c or []
+                        st.session_state["vectors"] = v
+                    else:
+                        st.session_state["chunks"] = []
+                        st.session_state["vectors"] = None
+                st.rerun()
+    else:
+        st.caption("No saved PDFs in memory yet. Upload a PDF to save it automatically.")
+
+    st.divider()
+    st.header("AI Mode Search Memory")
+    if saved_searches:
+        search_keys = list(reversed(list(saved_searches.keys())))
+        selected_search_key = st.selectbox(
+            "Saved AI Mode Queries",
+            options=search_keys,
+            format_func=lambda k: saved_searches[k]["query"],
+        )
+        g_col1, g_col2 = st.columns(2)
+        with g_col1:
+            if st.button("Recall Query", use_container_width=True):
+                recalled = dict(saved_searches[selected_search_key])
+                recalled["ai_mode_url"] = build_google_ai_mode_url(recalled.get("query", ""))
+                recalled["from_memory"] = True
+                msgs = st.session_state.setdefault("messages", [])
+                msgs.append({"role": "user", "content": f"Google AI Mode: {recalled['query']}"})
+                msgs.append({
+                    "role": "assistant",
+                    "content": format_google_ai_mode_reply(recalled),
+                    "sources": [],
+                    "ai_mode_ctx": recalled,
+                    "query_text": recalled["query"],
+                    "no_pdf_result": False,
+                })
+                persist_current_session()
+                st.rerun()
+        with g_col2:
+            if st.button("Clear Queries", use_container_width=True):
+                save_google_memory({"searches": {}})
+                st.rerun()
+    else:
+        st.caption("No saved AI Mode searches yet.")
+
+    st.divider()
+    st.header("Saved Notes & Formulas")
+    note_input = st.text_input("Remember a note / formula / fact", placeholder="e.g. τ = r × F × sin(θ)")
+    if st.button("Save Note", use_container_width=True) and note_input.strip():
+        clean_n = clean_readable_text(note_input, preserve_math=True)
+        manifest["saved_notes"].append(clean_n)
+        save_manifest(manifest)
+        detected = extract_formulas(clean_n)
+        if detected:
+            save_formulas_to_memory(detected)
+        st.rerun()
+    for idx, n_text in enumerate(manifest.get("saved_notes", [])):
+        c_note, c_del = st.columns([5, 1])
+        c_note.caption(f"• {n_text}")
+        with c_del:
+            st.markdown('<div class="circle-trigger-wrap">', unsafe_allow_html=True)
+            if st.button("×", key=f"del_note_{idx}"):
+                manifest["saved_notes"].pop(idx)
+                save_manifest(manifest)
+                st.rerun()
+            st.markdown("</div>", unsafe_allow_html=True)
+
+    saved_formulas = manifest.get("saved_formulas", [])
+    if saved_formulas:
+        st.caption("**Auto-Saved Formulas:**")
+        for f_idx, f_expr in enumerate(reversed(saved_formulas[-10:])):
+            f_col, f_del = st.columns([5, 1])
+            f_col.markdown(f"`{f_expr}`")
+            with f_del:
+                st.markdown('<div class="circle-trigger-wrap">', unsafe_allow_html=True)
+                if st.button("×", key=f"del_formula_{f_idx}"):
+                    real_idx = len(saved_formulas) - 1 - f_idx
+                    manifest["saved_formulas"].pop(real_idx)
+                    save_manifest(manifest)
+                    st.rerun()
+                st.markdown("</div>", unsafe_allow_html=True)
+
+    st.divider()
+    st.header("Settings")
+    use_free_local = st.checkbox(
+        "Use free local chunk summary (no API key needed)",
+        value=bool(prefs.get("use_free_local", True)),
+    )
+    api_key = st.text_input(
+        "Ollama API Key (optional)",
+        value=os.environ.get("OLLAMA_API_KEY", ""),
+        type="password",
+        placeholder="Paste Ollama API key if you have credits...",
+    )
+    model_name = st.text_input("Ollama Cloud Model", value=str(prefs.get("model_name", "gemma4:31b")))
+    top_k = st.slider("Top matching chunks to send", min_value=3, max_value=5, value=int(prefs.get("top_k", 4)))
+
+    clr_col, clr_note = st.columns([1, 4])
+    with clr_col:
+        st.markdown('<div class="circle-trigger-wrap">', unsafe_allow_html=True)
+        clear_clicked = st.button("✕", key="sb_clear_chat_btn", help="Clear current chat")
+        st.markdown("</div>", unsafe_allow_html=True)
+    with clr_note:
+        st.caption("Clear current chat")
+    if clear_clicked:
+        st.session_state["messages"] = []
+        st.rerun()
+
+st.markdown('<div class="ios27-glass-card">', unsafe_allow_html=True)
+st.caption("Select Chat Mode")
+if hasattr(st, "segmented_control"):
+    selected_mode = st.segmented_control(
+        "Mode",
+        options=MODES,
+        default=st.session_state["chat_mode"],
+        label_visibility="collapsed",
+    )
+else:
+    selected_mode = st.radio(
+        "Mode",
+        options=MODES,
+        index=MODES.index(st.session_state["chat_mode"]),
+        horizontal=True,
+        label_visibility="collapsed",
+    )
+st.markdown("</div>", unsafe_allow_html=True)
+
+if selected_mode and selected_mode != st.session_state["chat_mode"]:
+    st.session_state["chat_mode"] = selected_mode
+
+active_mode = st.session_state["chat_mode"]
+
+new_prefs = {
+    "mode": active_mode,
+    "theme": st.session_state["theme_mode"],
+    "use_free_local": use_free_local,
+    "model_name": model_name,
+    "top_k": top_k,
+}
+if new_prefs != prefs:
+    manifest["preferences"] = new_prefs
+    save_manifest(manifest)
+
+uploaded_file = st.file_uploader("Upload a new PDF (auto-saved to memory)", type=["pdf"])
+
+if uploaded_file is not None:
+    file_bytes = uploaded_file.getvalue()
+    doc_id = hashlib.sha256(file_bytes).hexdigest()[:12]
+    if st.session_state.get("active_doc_id") != doc_id:
+        if doc_id in load_manifest().get("docs", {}):
+            loaded_chunks, loaded_vectors = load_pdf_from_memory(doc_id)
+            if loaded_chunks is not None:
+                st.session_state["active_doc_id"] = doc_id
+                st.session_state["chunks"] = loaded_chunks
+                st.session_state["vectors"] = loaded_vectors
+                st.info(f"Loaded **{uploaded_file.name}** from memory.")
+        else:
+            with st.spinner("Extracting, cleaning math/text, embedding, and saving to memory..."):
+                chunks = extract_and_chunk_pdf(uploaded_file, chunk_words=500, overlap_words=80)
+                if chunks:
+                    vectors = embed_chunks(chunks)
+                    save_pdf_to_memory(doc_id, uploaded_file.name, chunks, vectors)
+                    st.session_state["active_doc_id"] = doc_id
+                    st.session_state["chunks"] = chunks
+                    st.session_state["vectors"] = vectors
+                else:
+                    st.session_state["active_doc_id"] = None
+                    st.session_state["chunks"] = []
+                    st.session_state["vectors"] = None
+
+chunks = st.session_state.get("chunks", [])
+vectors = st.session_state.get("vectors")
+active_id = st.session_state.get("active_doc_id")
+active_name = load_manifest().get("docs", {}).get(active_id, {}).get("filename") if active_id else None
+
+if active_mode == MODE_AI_MODE:
+    st.info("**Google AI Mode** active — queries open directly into Google Search AI Mode (`udm=50`) and are saved to search memory.")
+elif chunks and vectors is not None:
+    st.success(f"**Notes Chunks Summary** mode active | PDF in memory: **{active_name or 'PDF'}** ({len(chunks)} chunks).")
+else:
+    st.info("Fresh session ready. Upload/fetch a PDF or switch to **Google AI Mode**.")
+
+for msg in st.session_state.get("messages", []):
+    with st.chat_message(msg["role"]):
+        formulas_in_msg = msg.get("formulas") or []
+        if msg["role"] == "assistant" and formulas_in_msg:
+            st.markdown(highlight_formulas_in_text(msg["content"], formulas_in_msg), unsafe_allow_html=True)
+            st.caption("Detected Formulas: " + " | ".join(f"`{f}`" for f in formulas_in_msg))
+        else:
+            st.markdown(msg["content"])
+
+        if msg.get("ai_mode_ctx"):
+            ai_c = msg["ai_mode_ctx"]
+            ai_url = ai_c.get("ai_mode_url") or build_google_ai_mode_url(ai_c["query"])
+            with st.expander("Google AI Mode Link & Context"):
+                if ai_c.get("summary"):
+                    st.write(ai_c["summary"])
+                st.link_button("Google Ai mode", ai_url)
+        elif msg["role"] == "assistant":
+            render_google_ai_footer(
+                msg.get("query_text", ""),
+                no_pdf_result=bool(msg.get("no_pdf_result", False)),
+            )
+
+        if msg.get("sources"):
+            with st.expander("Retrieved chunks"):
+                for rank, item in enumerate(msg["sources"], start=1):
+                    st.markdown(
+                        f"**#{rank} — Page {item['page']} (Chunk #{item['chunk_id']})** "
+                        f"| Similarity: `{item['score']:.3f}`"
+                    )
+                    st.write(item["text"])
+                    st.divider()
+
+placeholder_text = (
+    "Ask in Google AI Mode (e.g., explain angular momentum)..."
+    if active_mode == MODE_AI_MODE
+    else "Summarize or ask from your PDF chunks..."
+)
+question = st.chat_input(placeholder_text)
+
+if question:
+    st.session_state["messages"].append({"role": "user", "content": question})
+    persist_current_session()
+    with st.chat_message("user"):
+        st.markdown(question)
+
+    ai_mode_ctx = None
+    matches = []
+    no_pdf_result = False
+    detected_formulas = []
+
+    with st.chat_message("assistant"):
+        if active_mode == MODE_AI_MODE:
+            ai_mode_ctx = fetch_google_ai_mode_context(question)
+            reply = format_google_ai_mode_reply(ai_mode_ctx)
+            detected_formulas = extract_formulas(reply + " " + question)
+            if detected_formulas:
+                save_formulas_to_memory(detected_formulas)
+                st.markdown(highlight_formulas_in_text(reply, detected_formulas), unsafe_allow_html=True)
+                st.caption("Detected Formulas: " + " | ".join(f"`{f}`" for f in detected_formulas))
+            else:
+                st.markdown(reply)
+
+            ai_url = ai_mode_ctx.get("ai_mode_url") or build_google_ai_mode_url(ai_mode_ctx["query"])
+            with st.expander("Google AI Mode Link & Context"):
+                if ai_mode_ctx.get("summary"):
+                    st.write(ai_mode_ctx["summary"])
+                st.link_button("Google Ai mode", ai_url)
+        else:
+            if chunks and vectors is not None:
+                matches = search_chunks(question, chunks, vectors, top_k=top_k)
+                if use_free_local or not api_key.strip():
+                    reply, no_pdf_result = answer_locally_from_chunks(question, matches)
+                else:
+                    with st.spinner(f"Asking {model_name} using retrieved chunks..."):
+                        try:
+                            reply = answer_with_ollama(question, matches, api_key, model=model_name)
+                            no_pdf_result = False
+                        except Exception as exc:
+                            reply = f"Error calling Ollama API: {exc}"
+                            no_pdf_result = True
+
+                detected_formulas = extract_formulas(reply + (" " + question if is_formula_query(question) else ""))
+                if detected_formulas:
+                    save_formulas_to_memory(detected_formulas)
+                    st.markdown(highlight_formulas_in_text(reply, detected_formulas), unsafe_allow_html=True)
+                    st.caption("Detected Formulas: " + " | ".join(f"`{f}`" for f in detected_formulas))
+                else:
+                    st.markdown(reply)
+
+                render_google_ai_footer(question, no_pdf_result=no_pdf_result)
+
+                with st.expander("Retrieved chunks"):
+                    for rank, item in enumerate(matches, start=1):
+                        st.markdown(
+                            f"**#{rank} — Page {item['page']} (Chunk #{item['chunk_id']})** "
+                            f"| Similarity: `{item['score']:.3f}`"
+                        )
+                        st.write(item["text"])
+                        st.divider()
+            else:
+                no_pdf_result = True
+                reply = "There's no results in the pdf, refer Google Ai mode futher"
+                detected_formulas = extract_formulas(question) if is_formula_query(question) else []
+                if detected_formulas:
+                    save_formulas_to_memory(detected_formulas)
+                st.markdown(reply)
+                render_google_ai_footer(question, no_pdf_result=True)
+
+    st.session_state["messages"].append({
+        "role": "assistant",
+        "content": reply,
+        "sources": matches,
+        "ai_mode_ctx": ai_mode_ctx,
+        "query_text": question,
+        "no_pdf_result": no_pdf_result,
+        "formulas": detected_formulas,
+    })
+    persist_current_session()
+'@ | Out-File -FilePath app.py -Encoding utf8
+
+streamlit run app.py
